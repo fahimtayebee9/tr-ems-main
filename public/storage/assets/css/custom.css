@@ -1,0 +1,89 @@
+#attendance-tbl::-webkit-scrollbar-track {
+    -webkit-box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.3);
+    background-color: #F5F5F5;
+    border-radius: 10px;
+}
+
+#attendance-tbl::-webkit-scrollbar {
+    height: 10px;
+    background-color: #F5F5F5;
+    
+}
+
+.daily-stat{
+    background-color: #d8e8ff;
+    color: #fff;
+    border-radius: 5px;
+    min-width: 200px;
+    color: #011127;
+}
+.daily-stat h4{
+    font-size: 26px;
+    font-weight: 700;
+    margin-bottom: 0px;
+    padding: 15px 10px;
+}
+.daily-stat h6{
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 0px;
+}
+/* .all-sales{
+    background-color: #cbfa96;
+}
+.tacos{
+    background-color: #f9c7c7;
+}
+.acos{
+    background-color: #bddaff;
+}
+.ads-sales{
+    background-color: #ffe3b8;
+}
+.cost{
+    background-color: #f9c7c7;
+}
+.clicks{
+    background-color: #cbfa96;
+}
+.impressions{
+    background-color: #bddaff;
+} */
+.stat-header{
+    background-color: #011127;
+    color: #fff;
+    padding: 8px;
+    border-top-right-radius: 5px;
+    border-top-left-radius: 5px;
+    min-width: 200px;
+    color: #fff;
+}
+
+#attendance-tbl::-webkit-scrollbar-thumb:horizontal {
+    background-color: #F90;
+    background-image: -webkit-linear-gradient(45deg,
+            rgba(255, 255, 255, .2) 25%,
+            transparent 25%,
+            transparent 50%,
+            rgba(255, 255, 255, .2) 50%,
+            rgba(255, 255, 255, .2) 75%,
+            transparent 75%,
+            transparent);
+    border-radius: 10px;
+}
+
+#employees_tbl_wrapper .row:last-child {
+    padding: 30px 0px;
+}
+#employees_tbl_wrapper .dataTables_paginate {
+    justify-content: end;
+    display: flex;
+    align-self: center;
+}
+
+.modal-backdrop {
+    background-color: #0B2447!important;
+}
+.modal-backdrop.show {
+    opacity: 0.75!important;
+}

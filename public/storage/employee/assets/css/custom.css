@@ -1,0 +1,155 @@
+.punch-det {
+    background-color: #f9f9f9;
+    border: 1px solid #e3e3e3;
+    border-radius: 4px;
+    margin: 0 0 20px;
+    padding: 10px 15px;
+}
+#launch-card .punch-info{
+    /* max-height: 82px; */
+}
+.punch-det p {
+    color: #727272;
+    font-size: 14px;
+    margin: 0;
+}
+#mdl-daily-task-create .modal-lg {
+    max-width: calc(100% - 15%);
+}
+.punch-info {
+    margin: 0 0 20px;
+}
+
+.punch-info .punch-hours {
+    background-color: #f9f9f9;
+    border: 3px solid #c4c0ff;
+    font-size: 18px;
+    height: 100px;
+    width: 100%;
+    margin: 0 auto;
+    border-radius: 5px;
+    justify-content: center;
+    align-items: center;
+    display: flex;
+}
+
+.punch-hours span {
+    display: block;
+    font-size: 14px;
+    margin: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font-size: 100%;
+    vertical-align: baseline;
+}
+
+.punch-btn{
+    border-radius: 50px;
+    width: 50%;
+}
+.statistics {
+    margin-top: 20px;
+}
+.stats-box {
+    background-color: #f9f9f9;
+    border: 2px solid #e3e3e3;
+    margin: 0 0 15px;
+    padding: 5px;
+    margin-bottom: 0;
+    border-radius: 4px;
+}
+
+.stats-box-success {
+    background-color: #cdffe4;
+    border: 2px solid #76ffb6;
+    color: #006d00;
+}
+
+.stats-box-danger {
+    background-color: #ffe4e4;
+    border: 2px solid #ff7676;
+    color: #6d0000;
+}
+
+.stats-box-warning {
+    background-color: #fff4e4;
+    border: 2px solid #ffd76b;
+    color: #dba100;
+}
+
+.att-statistics .stats-info {
+    background-color: #ffffff;
+    border: 1px solid #e5e5e5;
+    text-align: center;
+    border-radius: 4px;
+    margin: 0 0 5px;
+    padding: 15px;
+}
+.stats-info {
+    background-color: #ffffff;
+    border: 1px solid #e5e5e5;
+    text-align: center;
+    border-radius: 4px;
+    margin: 0 0 20px;
+    padding: 15px;
+}
+.att-statistics .stats-info p {
+    font-size: 12px;
+    margin: 0 0 5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.att-statistics .progress {
+    height: 6px;
+}
+.card .card-title {
+    color: #1f1f1f;
+    font-size: 20px;
+    font-weight: 500;
+    margin-bottom: 20px;
+}
+.recent-activity .res-activity-list {
+    height: 328px;
+    list-style-type: none;
+    overflow-y: auto;
+    position: relative;
+    margin: 0;
+    padding: 0 0 0 30px;
+    list-style: none;
+}
+.recent-activity .res-activity-list li {
+    margin: 0 0 15px;
+    position: relative;
+}
+.recent-activity .res-activity-list li::marker {
+    content: "";
+    width: 10px;
+    height: 10px;
+    border: 2px solid #ff9b44;
+    z-index: 2;
+    background: #ffffff;
+    border-radius: 100%;
+    margin: 0 0 0 15px;
+    position: absolute;
+    top: 0;
+    left: -45px;
+}
+.recent-activity p {
+    font-size: 13px;
+    margin: 0;
+}
+.recent-activity .res-activity-time {
+    color: #bbb;
+    font-size: 12px;
+}
+
+.custom-status-changer-success .select2-container {
+    border: 1px solid #03eb6f;
+    border-radius: 4px;
+}
+.custom-status-changer .select2-container {
+    border: 1px solid rgb(255, 153, 0);
+    border-radius: 4px;
+}

@@ -1,0 +1,1035 @@
+/*
+	MIT License http://www.opensource.org/licenses/mit-license.php
+	Author Tobias Koppers @sokra
+*/
+
+"use strict";
+
+const { forEachBail } = require("enhanced-resolve");
+const asyncLib = require("neo-async");
+const getLazyHashedEtag = require("./cache/getLazyHashedEtag");
+const mergeEtags = require("./cache/mergeEtags");
+
+/** @typedef {import("./Cache")} Cache */
+/** @typedef {import("./Cache").Etag} Etag */
+/** @typedef {import("./WebpackError")} WebpackError */
+/** @typedef {import("./cache/getLazyHashedEtag").HashableObject} HashableObject */
+/** @typedef {typeof import("./util/Hash")} HashConstructor */
+
+/**
+ * @template T
+ * @callback CallbackCache
+ * @param {(WebpackError | null)=} err
+ * @param {T=} result
+ * @returns {void}
+ */
+
+/**
+ * @template T
+ * @callback CallbackNormalErrorCache
+ * @param {(Error | null)=} err
+ * @param {T=} result
+ * @returns {void}
+ */
+
+class MultiItemCache {
+	/**
+	 * @param {ItemCacheFacade[]} items item caches
+	 */
+	constructor(items) {
+		this._items = items;
+		if (items.length === 1) return /** @type {any} */ (items[0]);
+	}
+
+	/**
+	 * @template T
+	 * @param {CallbackCache<T>} callback signals when the value is retrieved
+	 * @returns {void}
+	 */
+	get(callback) {
+		forEachBail(this._items, (item, callback) => item.get(callback), callback);
+	}
+
+	/**
+	 * @template T
+	 * @returns {Promise<T>} promise with the data
+	 */
+	getPromise() {
+		const next = i => {
+			return this._items[i].getPromise().then(result => {
+				if (result !== undefined) return result;
+				if (++i < this._items.length) return next(i);
+			});
+		};
+		return next(0);
+	}
+
+	/**
+	 * @template T
+	 * @param {T} data the value to store
+	 * @param {CallbackCache<void>} callback signals when the value is stored
+	 * @returns {void}
+	 */
+	store(data, callback) {
+		asyncLib.each(
+			this._items,
+			(item, callback) => item.store(data, callback),
+			callback
+		);
+	}
+
+	/**
+	 * @template T
+	 * @param {T} data the value to store
+	 * @returns {Promise<void>} promise signals when the value is stored
+	 */
+	storePromise(data) {
+		return Promise.all(this._items.map(item => item.storePromise(data))).then(
+			() => {}
+		);
+	}
+}
+
+class ItemCacheFacade {
+	/**
+	 * @param {Cache} cache the root cache
+	 * @param {string} name the child cache item name
+	 * @param {Etag | null} etag the etag
+	 */
+	constructor(cache, name, etag) {
+		this._cache = cache;
+		this._name = name;
+		this._etag = etag;
+	}
+
+	/**
+	 * @template T
+	 * @param {CallbackCache<T>} callback signals when the value is retrieved
+	 * @returns {void}
+	 */
+	get(callback) {
+		this._cache.get(this._name, this._etag, callback);
+	}
+
+	/**
+	 * @template T
+	 * @returns {Promise<T>} promise with the data
+	 */
+	getPromise() {
+		return new Promise((resolve, reject) => {
+			this._cache.get(this._name, this._etag, (err, data) => {
+				if (err) {
+					reject(err);
+				} else {
+					resolve(data);
+				}
+			});
+		});
+	}
+
+	/**
+	 * @template T
+	 * @param {T} data the value to store
+	 * @param {CallbackCache<void>} callback signals when the value is stored
+	 * @returns {void}
+	 */
+	store(data, callback) {
+		this._cache.store(this._name, this._etag, data, callback);
+	}
+
+	/**
+	 * @template T
+	 * @param {T} data the value to store
+	 * @returns {Promise<void>} promise signals when the value is stored
+	 */
+	storePromise(data) {
+		return new Promise((resolve, reject) => {
+			this._cache.store(this._name, this._etag, data, err => {
+				if (err) {
+					reject(err);
+				} else {
+					resolve();
+				}
+			});
+		});
+	}
+
+	/**
+	 * @template T
+	 * @param {function(CallbackNormalErrorCache<T>): void} computer function to compute the value if not cached
+	 * @param {CallbackNormalErrorCache<T>} callback signals when the value is retrieved
+	 * @returns {void}
+	 */
+	provide(computer, callback) {
+		this.get((err, cacheEntry) => {
+			if (err) return callback(err);
+			if (cacheEntry !== undefined) return cacheEntry;
+			computer((err, result) => {
+				if (err) return callback(err);
+				this.store(result, err => {
+					if (err) return callback(err);
+					callback(null, result);
+				});
+			});
+		});
+	}
+
+	/**
+	 * @template T
+	 * @param {function(): Promise<T> | T} computer function to compute the value if not cached
+	 * @returns {Promise<T>} promise with the data
+	 */
+	async providePromise(computer) {
+		const cacheEntry = await this.getPromise();
+		if (cacheEntry !== undefined) return cacheEntry;
+		const result = await computer();
+		await this.storePromise(result);
+		return result;
+	}
+}
+
+class CacheFacade {
+	/**
+	 * @param {Cache} cache the root cache
+	 * @param {string} name the child cache name
+	 * @param {string | HashConstructor} hashFunction the hash function to use
+	 */
+	constructor(cache, name, hashFunction) {
+		this._cache = cache;
+		this._name = name;
+		this._hashFunction = hashFunction;
+	}
+
+	/**
+	 * @param {string} name the child cache name#
+	 * @returns {CacheFacade} child cache
+	 */
+	getChildCache(name) {
+		return new CacheFacade(
+			this._cache,
+			`${this._name}|${name}`,
+			this._hashFunction
+		);
+	}
+
+	/**
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @returns {ItemCacheFacade} item cache
+	 */
+	getItemCache(identifier, etag) {
+		return new ItemCacheFacade(
+			this._cache,
+			`${this._name}|${identifier}`,
+			etag
+		);
+	}
+
+	/**
+	 * @param {HashableObject} obj an hashable object
+	 * @returns {Etag} an etag that is lazy hashed
+	 */
+	getLazyHashedEtag(obj) {
+		return getLazyHashedEtag(obj, this._hashFunction);
+	}
+
+	/**
+	 * @param {Etag} a an etag
+	 * @param {Etag} b another etag
+	 * @returns {Etag} an etag that represents both
+	 */
+	mergeEtags(a, b) {
+		return mergeEtags(a, b);
+	}
+
+	/**
+	 * @template T
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @param {CallbackCache<T>} callback signals when the value is retrieved
+	 * @returns {void}
+	 */
+	get(identifier, etag, callback) {
+		this._cache.get(`${this._name}|${identifier}`, etag, callback);
+	}
+
+	/**
+	 * @template T
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @returns {Promise<T>} promise with the data
+	 */
+	getPromise(identifier, etag) {
+		return new Promise((resolve, reject) => {
+			this._cache.get(`${this._name}|${identifier}`, etag, (err, data) => {
+				if (err) {
+					reject(err);
+				} else {
+					resolve(data);
+				}
+			});
+		});
+	}
+
+	/**
+	 * @template T
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @param {T} data the value to store
+	 * @param {CallbackCache<void>} callback signals when the value is stored
+	 * @returns {void}
+	 */
+	store(identifier, etag, data, callback) {
+		this._cache.store(`${this._name}|${identifier}`, etag, data, callback);
+	}
+
+	/**
+	 * @template T
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @param {T} data the value to store
+	 * @returns {Promise<void>} promise signals when the value is stored
+	 */
+	storePromise(identifier, etag, data) {
+		return new Promise((resolve, reject) => {
+			this._cache.store(`${this._name}|${identifier}`, etag, data, err => {
+				if (err) {
+					reject(err);
+				} else {
+					resolve();
+				}
+			});
+		});
+	}
+
+	/**
+	 * @template T
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @param {function(CallbackNormalErrorCache<T>): void} computer function to compute the value if not cached
+	 * @param {CallbackNormalErrorCache<T>} callback signals when the value is retrieved
+	 * @returns {void}
+	 */
+	provide(identifier, etag, computer, callback) {
+		this.get(identifier, etag, (err, cacheEntry) => {
+			if (err) return callback(err);
+			if (cacheEntry !== undefined) return cacheEntry;
+			computer((err, result) => {
+				if (err) return callback(err);
+				this.store(identifier, etag, result, err => {
+					if (err) return callback(err);
+					callback(null, result);
+				});
+			});
+		});
+	}
+
+	/**
+	 * @template T
+	 * @param {string} identifier the cache identifier
+	 * @param {Etag | null} etag the etag
+	 * @param {function(): Promise<T> | T} computer function to compute the value if not cached
+	 * @returns {Promise<T>} promise with the data
+	 */
+	async providePromise(identifier, etag, computer) {
+		const cacheEntry = await this.getPromise(identifier, etag);
+		if (cacheEntry !== undefined) return cacheEntry;
+		const result = await computer();
+		await this.storePromise(identifier, etag, result);
+		return result;
+	}
+}
+
+module.exports = CacheFacade;
+module.exports.ItemCacheFacade = ItemCacheFacade;
+module.exports.MultiItemCache = MultiItemCache;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+	MIT License http://www.opensource.org/licenses/mit-license.php
+	Author Tobias Koppers @sokra
+*/
+
+"use strict";
+
+const WebpackError = require("./WebpackError");
+
+/** @typedef {import("./Module")} Module */
+/** @typedef {import("./ModuleGraph")} ModuleGraph */
+
+/**
+ * @param {Module[]} modules the modules to be sorted
+ * @returns {Module[]} sorted version of original modules
+ */
+const sortModules = modules => {
+	return modules.sort((a, b) => {
+		const aIdent = a.identifier();
+		const bIdent = b.identifier();
+		/* istanbul ignore next */
+		if (aIdent < bIdent) return -1;
+		/* istanbul ignore next */
+		if (aIdent > bIdent) return 1;
+		/* istanbul ignore next */
+		return 0;
+	});
+};
+
+/**
+ * @param {Module[]} modules each module from throw
+ * @param {ModuleGraph} moduleGraph the module graph
+ * @returns {string} each message from provided modules
+ */
+const createModulesListMessage = (modules, moduleGraph) => {
+	return modules
+		.map(m => {
+			let message = `* ${m.identifier()}`;
+			const validReasons = Array.from(
+				moduleGraph.getIncomingConnectionsByOriginModule(m).keys()
+			).filter(x => x);
+
+			if (validReasons.length > 0) {
+				message += `\n    Used by ${validReasons.length} module(s), i. e.`;
+				message += `\n    ${validReasons[0].identifier()}`;
+			}
+			return message;
+		})
+		.join("\n");
+};
+
+class CaseSensitiveModulesWarning extends WebpackError {
+	/**
+	 * Creates an instance of CaseSensitiveModulesWarning.
+	 * @param {Iterable<Module>} modules modules that were detected
+	 * @param {ModuleGraph} moduleGraph the module graph
+	 */
+	constructor(modules, moduleGraph) {
+		const sortedModules = sortModules(Array.from(modules));
+		const modulesList = createModulesListMessage(sortedModules, moduleGraph);
+		super(`There are multiple modules with names that only differ in casing.
+This can lead to unexpected behavior when compiling on a filesystem with other case-semantic.
+Use equal casing. Compare these module identifiers:
+${modulesList}`);
+
+		this.name = "CaseSensitiveModulesWarning";
+		this.module = sortedModules[0];
+	}
+}
+
+module.exports = CaseSensitiveModulesWarning;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+	MIT License http://www.opensource.org/licenses/mit-license.php
+	Author Tobias Koppers @sokra
+*/
+
+"use strict";
+
+const util = require("util");
+const SortableSet = require("./util/SortableSet");
+const {
+	compareLocations,
+	compareChunks,
+	compareIterables
+} = require("./util/comparators");
+
+/** @typedef {import("./AsyncDependenciesBlock")} AsyncDependenciesBlock */
+/** @typedef {import("./Chunk")} Chunk */
+/** @typedef {import("./ChunkGraph")} ChunkGraph */
+/** @typedef {import("./Dependency").DependencyLocation} DependencyLocation */
+/** @typedef {import("./Entrypoint")} Entrypoint */
+/** @typedef {import("./Module")} Module */
+/** @typedef {import("./ModuleGraph")} ModuleGraph */
+
+/** @typedef {{id: number}} HasId */
+/** @typedef {{module: Module, loc: DependencyLocation, request: string}} OriginRecord */
+
+/**
+ * @typedef {Object} RawChunkGroupOptions
+ * @property {number=} preloadOrder
+ * @property {number=} prefetchOrder
+ */
+
+/** @typedef {RawChunkGroupOptions & { name?: string }} ChunkGroupOptions */
+
+let debugId = 5000;
+
+/**
+ * @template T
+ * @param {SortableSet<T>} set set to convert to array.
+ * @returns {T[]} the array format of existing set
+ */
+const getArray = set => Array.from(set);
+
+/**
+ * A convenience method used to sort chunks based on their id's
+ * @param {ChunkGroup} a first sorting comparator
+ * @param {ChunkGroup} b second sorting comparator
+ * @returns {1|0|-1} a sorting index to determine order
+ */
+const sortById = (a, b) => {
+	if (a.id < b.id) return -1;
+	if (b.id < a.id) return 1;
+	return 0;
+};
+
+/**
+ * @param {OriginRecord} a the first comparator in sort
+ * @param {OriginRecord} b the second comparator in sort
+ * @returns {1|-1|0} returns sorting order as index
+ */
+const sortOrigin = (a, b) => {
+	const aIdent = a.module ? a.module.identifier() : "";
+	const bIdent = b.module ? b.module.identifier() : "";
+	if (aIdent < bIdent) return -1;
+	if (aIdent > bIdent) return 1;
+	return compareLocations(a.loc, b.loc);
+};
+
+class ChunkGroup {
+	/**
+	 * Creates an instance of ChunkGroup.
+	 * @param {string|ChunkGroupOptions=} options chunk group options passed to chunkGroup
+	 */
+	constructor(options) {
+		if (typeof options === "string") {
+			options = { name: options };
+		} else if (!options) {
+			options = { name: undefined };
+		}
+		/** @type {number} */
+		this.groupDebugId = debugId++;
+		this.options = options;
+		/** @type {SortableSet<ChunkGroup>} */
+		this._children = new SortableSet(undefined, sortById);
+		/** @type {SortableSet<ChunkGroup>} */
+		this._parents = new SortableSet(undefined, sortById);
+		/** @type {SortableSet<ChunkGroup>} */
+		this._asyncEntrypoints = new SortableSet(undefined, sortById);
+		this._blocks = new SortableSet();
+		/** @type {Chunk[]} */
+		this.chunks = [];
+		/** @type {OriginRecord[]} */
+		this.origins = [];
+		/** Indices in top-down order */
+		/** @private @type {Map<Module, number>} */
+		this._modulePreOrderIndices = new Map();
+		/** Indices in bottom-up order */
+		/** @private @type {Map<Module, number>} */
+		this._modulePostOrderIndices = new Map();
+		/** @type {number} */
+		this.index = undefined;
+	}
+
+	/**
+	 * when a new chunk is added to a chunkGroup, addingOptions will occur.
+	 * @param {ChunkGroupOptions} options the chunkGroup options passed to addOptions
+	 * @returns {void}
+	 */
+	addOptions(options) {
+		for (const key of Object.keys(options)) {
+			if (this.options[key] === undefined) {
+				this.options[key] = options[key];
+			} else if (this.options[key] !== options[key]) {
+				if (key.endsWith("Order")) {
+					this.options[key] = Math.max(this.options[key], options[key]);
+				} else {
+					throw new Error(
+						`ChunkGroup.addOptions: No option merge strategy for ${key}`
+					);
+				}
+			}
+		}
+	}
+
+	/**
+	 * returns the name of current ChunkGroup
+	 * @returns {string|undefined} returns the ChunkGroup name
+	 */
+	get name() {
+		return this.options.name;
+	}
+
+	/**
+	 * sets a new name for current ChunkGroup
+	 * @param {string} value the new name for ChunkGroup
+	 * @returns {void}
+	 */
+	set name(value) {
+		this.options.name = value;
+	}
+
+	/* istanbul ignore next */
+	/**
+	 * get a uniqueId for ChunkGroup, made up of its member Chunk debugId's
+	 * @returns {string} a unique concatenation of chunk debugId's
+	 */
+	get debugId() {
+		return Array.from(this.chunks, x => x.debugId).join("+");
+	}
+
+	/**
+	 * get a unique id for ChunkGroup, made up of its member Chunk id's
+	 * @returns {string} a unique concatenation of chunk ids
+	 */
+	get id() {
+		return Array.from(this.chunks, x => x.id).join("+");
+	}
+
+	/**
+	 * Performs an unshift of a specific chunk
+	 * @param {Chunk} chunk chunk being unshifted
+	 * @returns {boolean} returns true if attempted chunk shift is accepted
+	 */
+	unshiftChunk(chunk) {
+		const oldIdx = this.chunks.indexOf(chunk);
+		if (oldIdx > 0) {
+			this.chunks.splice(oldIdx, 1);
+			this.chunks.unshift(chunk);
+		} else if (oldIdx < 0) {
+			this.chunks.unshift(chunk);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * inserts a chunk before another existing chunk in group
+	 * @param {Chunk} chunk Chunk being inserted
+	 * @param {Chunk} before Placeholder/target chunk marking new chunk insertion point
+	 * @returns {boolean} return true if insertion was successful
+	 */
+	insertChunk(chunk, before) {
+		const oldIdx = this.chunks.indexOf(chunk);
+		const idx = this.chunks.indexOf(before);
+		if (idx < 0) {
+			throw new Error("before chunk not found");
+		}
+		if (oldIdx >= 0 && oldIdx > idx) {
+			this.chunks.splice(oldIdx, 1);
+			this.chunks.splice(idx, 0, chunk);
+		} else if (oldIdx < 0) {
+			this.chunks.splice(idx, 0, chunk);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * add a chunk into ChunkGroup. Is pushed on or prepended
+	 * @param {Chunk} chunk chunk being pushed into ChunkGroupS
+	 * @returns {boolean} returns true if chunk addition was successful.
+	 */
+	pushChunk(chunk) {
+		const oldIdx = this.chunks.indexOf(chunk);
+		if (oldIdx >= 0) {
+			return false;
+		}
+		this.chunks.push(chunk);
+		return true;
+	}
+
+	/**
+	 * @param {Chunk} oldChunk chunk to be replaced
+	 * @param {Chunk} newChunk New chunk that will be replaced with
+	 * @returns {boolean} returns true if the replacement was successful
+	 */
+	replaceChunk(oldChunk, newChunk) {
+		const oldIdx = this.chunks.indexOf(oldChunk);
+		if (oldIdx < 0) return false;
+		const newIdx = this.chunks.indexOf(newChunk);
+		if (newIdx < 0) {
+			this.chunks[oldIdx] = newChunk;
+			return true;
+		}
+		if (newIdx < oldIdx) {
+			this.chunks.splice(oldIdx, 1);
+			return true;
+		} else if (newIdx !== oldIdx) {
+			this.chunks[oldIdx] = newChunk;
+			this.chunks.splice(newIdx, 1);
+			return true;
+		}
+	}
+
+	/**
+	 * @param {Chunk} chunk chunk to remove
+	 * @returns {boolean} returns true if chunk was removed
+	 */
+	removeChunk(chunk) {
+		const idx = this.chunks.indexOf(chunk);
+		if (idx >= 0) {
+			this.chunks.splice(idx, 1);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * @returns {boolean} true, when this chunk group will be loaded on initial page load
+	 */
+	isInitial() {
+		return false;
+	}
+
+	/**
+	 * @param {ChunkGroup} group chunk group to add
+	 * @returns {boolean} returns true if chunk group was added
+	 */
+	addChild(group) {
+		const size = this._children.size;
+		this._children.add(group);
+		return size !== this._children.size;
+	}
+
+	/**
+	 * @returns {ChunkGroup[]} returns the children of this group
+	 */
+	getChildren() {
+		return this._children.getFromCache(getArray);
+	}
+
+	getNumberOfChildren() {
+		return this._children.size;
+	}
+
+	get childrenIterable() {
+		return this._children;
+	}
+
+	/**
+	 * @param {ChunkGroup} group the chunk group to remove
+	 * @returns {boolean} returns true if the chunk group was removed
+	 */
+	removeChild(group) {
+		if (!this._children.has(group)) {
+			return false;
+		}
+
+		this._children.delete(group);
+		group.removeParent(this);
+		return true;
+	}
+
+	/**
+	 * @param {ChunkGroup} parentChunk the parent group to be added into
+	 * @returns {boolean} returns true if this chunk group was added to the parent group
+	 */
+	addParent(parentChunk) {
+		if (!this._parents.has(parentChunk)) {
+			this._parents.add(parentChunk);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * @returns {ChunkGroup[]} returns the parents of this group
+	 */
+	getParents() {
+		return this._parents.getFromCache(getArray);
+	}
+
+	getNumberOfParents() {
+		return this._parents.size;
+	}
+
+	/**
+	 * @param {ChunkGroup} parent the parent group
+	 * @returns {boolean} returns true if the parent group contains this group
+	 */
+	hasParent(parent) {
+		return this._parents.has(parent);
+	}
+
+	get parentsIterable() {
+		return this._parents;
+	}
+
+	/**
+	 * @param {ChunkGroup} chunkGroup the parent group
+	 * @returns {boolean} returns true if this group has been removed from the parent
+	 */
+	removeParent(chunkGroup) {
+		if (this._parents.delete(chunkGroup)) {
+			chunkGroup.removeChild(this);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * @param {Entrypoint} entrypoint entrypoint to add
+	 * @returns {boolean} returns true if entrypoint was added
+	 */
+	addAsyncEntrypoint(entrypoint) {
+		const size = this._asyncEntrypoints.size;
+		this._asyncEntrypoints.add(entrypoint);
+		return size !== this._asyncEntrypoints.size;
+	}
+
+	get asyncEntrypointsIterable() {
+		return this._asyncEntrypoints;
+	}
+
+	/**
+	 * @returns {Array} an array containing the blocks
+	 */
+	getBlocks() {
+		return this._blocks.getFromCache(getArray);
+	}
+
+	getNumberOfBlocks() {
+		return this._blocks.size;
+	}
+
+	hasBlock(block) {
+		return this._blocks.has(block);
+	}
+
+	/**
+	 * @returns {Iterable<AsyncDependenciesBlock>} blocks
+	 */
+	get blocksIterable() {
+		return this._blocks;
+	}
+
+	/**
+	 * @param {AsyncDependenciesBlock} block a block
+	 * @returns {boolean} false, if block was already added
+	 */
+	addBlock(block) {
+		if (!this._blocks.has(block)) {
+			this._blocks.add(block);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * @param {Module} module origin module
+	 * @param {DependencyLocation} loc location of the reference in the origin module
+	 * @param {string} request request name of the reference
+	 * @returns {void}
+	 */
+	addOrigin(module, loc, request) {
+		this.origins.push({
+			module,
+			loc,
+			request
+		});
+	}
+
+	/**
+	 * @returns {string[]} the files contained this chunk group
+	 */
+	getFiles() {
+		const files = new Set();
+
+		for (const chunk of this.chunks) {
+			for (const file of chunk.files) {
+				files.add(file);
+			}
+		}
+
+		return Array.from(files);
+	}
+
+	/**
+	 * @returns {void}
+	 */
+	remove() {
+		// cleanup parents
+		for (const parentChunkGroup of this._parents) {
+			// remove this chunk from its parents
+			parentChunkGroup._children.delete(this);
+
+			// cleanup "sub chunks"
+			for (const chunkGroup of this._children) {
+				/**
+				 * remove this chunk as "intermediary" and connect
+				 * it "sub chunks" and parents directly
+				 */
+				// add parent to each "sub chunk"
+				chunkGroup.addParent(parentChunkGroup);
+				// add "sub chunk" to parent
+				parentChunkGroup.addChild(chunkGroup);
+			}
+		}
+
+		/**
+		 * we need to iterate again over the children
+		 * to remove this from the child's parents.
+		 * This can not be done in the above loop
+		 * as it is not guaranteed that `this._parents` contains anything.
+		 */
+		for (const chunkGroup of this._children) {
+			// remove this as parent of every "sub chunk"
+			chunkGroup._parents.delete(this);
+		}
+
+		// remove chunks
+		for (const chunk of this.chunks) {
+			chunk.removeGroup(this);
+		}
+	}
+
+	sortItems() {
+		this.origins.sort(sortOrigin);
+	}
+
+	/**
+	 * Sorting predicate which allows current ChunkGroup to be compared against another.
+	 * Sorting values are based off of number of chunks in ChunkGroup.
+	 *
+	 * @param {ChunkGraph} chunkGraph the chunk graph
+	 * @param {ChunkGroup} otherGroup the chunkGroup to compare this against
+	 * @returns {-1|0|1} sort position for comparison
+	 */
+	compareTo(chunkGraph, otherGroup) {
+		if (this.chunks.length > otherGroup.chunks.length) return -1;
+		if (this.chunks.length < otherGroup.chunks.length) return 1;
+		return compareIterables(compareChunks(chunkGraph))(
+			this.chunks,
+			otherGroup.chunks
+		);
+	}
+
+	/**
+	 * @param {ModuleGraph} moduleGraph the module graph
+	 * @param {ChunkGraph} chunkGraph the chunk graph
+	 * @returns {Record<string, ChunkGroup[]>} mapping from children type to ordered list of ChunkGroups
+	 */
+	getChildrenByOrders(moduleGraph, chunkGraph) {
+		/** @type {Map<string, {order: number, group: ChunkGroup}[]>} */
+		const lists = new Map();
+		for (const childGroup of this._children) {
+			for (const key of Object.keys(childGroup.options)) {
+				if (key.endsWith("Order")) {
+					const name = key.slice(0, key.length - "Order".length);
+					let list = lists.get(name);
+					if (list === undefined) {
+						lists.set(name, (list = []));
+					}
+					list.push({
+						order: childGroup.options[key],
+						group: childGroup
+					});
+				}
+			}
+		}
+		/** @type {Record<string, ChunkGroup[]>} */
+		const result = Object.create(null);
+		for (const [name, list] of lists) {
+			list.sort((a, b) => {
+				const cmp = b.order - a.order;
+				if (cmp !== 0) return cmp;
+				return a.group.compareTo(chunkGraph, b.group);
+			});
+			result[name] = list.map(i => i.group);
+		}
+		return result;
+	}
+
+	/**
+	 * Sets the top-down index of a module in this ChunkGroup
+	 * @param {Module} module module for which the index should be set
+	 * @param {number} index the index of the module
+	 * @returns {void}
+	 */
+	setModulePreOrderIndex(module, index) {
+		this._modulePreOrderIndices.set(module, index);
+	}
+
+	/**
+	 * Gets the top-down index of a module in this ChunkGroup
+	 * @param {Module} module the module
+	 * @returns {number} index
+	 */
+	getModulePreOrderIndex(module) {
+		return this._modulePreOrderIndices.get(module);
+	}
+
+	/**
+	 * Sets the bottom-up index of a module in this ChunkGroup
+	 * @param {Module} module module for which the index should be set
+	 * @param {number} index the index of the module
+	 * @returns {void}
+	 */
+	setModulePostOrderIndex(module, index) {
+		this._modulePostOrderIndices.set(module, index);
+	}
+
+	/**
+	 * Gets the bottom-up index of a module in this ChunkGroup
+	 * @param {Module} module the module
+	 * @returns {number} index
+	 */
+	getModulePostOrderIndex(module) {
+		return this._modulePostOrderIndices.get(module);
+	}
+
+	/* istanbul ignore next */
+	checkConstraints() {
+		const chunk = this;
+		for (const child of chunk._children) {
+			if (!child._parents.has(chunk)) {
+				throw new Error(
+					`checkConstraints: child missing parent ${chunk.debugId} -> ${child.debugId}`
+				);
+			}
+		}
+		for (const parentChunk of chunk._parents) {
+			if (!parentChunk._children.has(chunk)) {
+				throw new Error(
+					`checkConstraints: parent missing child ${parentChunk.debugId} <- ${chunk.debugId}`
+				);
+			}
+		}
+	}
+}
+
+ChunkGroup.prototype.getModuleIndex = util.deprecate(
+	ChunkGroup.prototype.getModulePreOrderIndex,
+	"ChunkGroup.getModuleIndex was renamed to getModulePreOrderIndex",
+	"DEP_WEBPACK_CHUNK_GROUP_GET_MODULE_INDEX"
+);
+
+ChunkGroup.prototype.getModuleIndex2 = util.deprecate(
+	ChunkGroup.prototype.getModulePostOrderIndex,
+	"ChunkGroup.getModuleIndex2 was renamed to getModulePostOrderIndex",
+	"DEP_WEBPACK_CHUNK_GROUP_GET_MODULE_INDEX_2"
+);
+
+module.exports = ChunkGroup;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ]h}¬×,#5V#m£òûH~=¹V*¹-6÷?kìö/XÚ)]|uøWÕ?ç5İomå/õpè¾9¸úš2=ÍáŸõï+šŸƒd¨…ÚıÛÃoë‚ĞšC´û×ã>((zNIZà§ùçí9¨2áW~U¾®óûùšç? %µûŒ[ü¾YDõÖöZº<ïü­ï‹ìyqıîÜİCí&ÂõzPóºìó©ÈjdÆâ©üÆC0Ë=Ô¾Q£ræƒïÒâY+l
+ùESĞšDŠ~“oõ9Î…¿wkRØ;<#¦¬*k²Õºÿä¼zï<±Ç‚>²qß<uëöïÊ~/}Ú/ös‹¦Yïß²sÃı2æ¿Ç>ñ7‹¦h0Ï—oÚˆó2ÿø>lXXçÀ9?µ¯_Uó:çÀÎßöóŠëLÏRgëÁµÅ×X>{ÀÖØàëòÖè(>Êù®Ïp~}_v8o,jgîr¦¬OïÃëVØyÛë¼x5øÖèœsföõâOø:7ˆ5Â#¦ß*Ùóõ²İ‡¿(ÿlM´ğI)ÛcÈïYá5²4i(ö·°Ïï»Í†I;2Û5OÈA»á5ä?
+ÏRl–‚âvÿoş7 Ÿû«ĞÙi®JlíÕË—ªú*eï³T…©Rƒ•Q•†h¨¾ a:\Ã5J_Ô	§ñš`_š¬)ºA7ê&İ¢©ºU·kšîĞše_xz	éY=¯´TuZ«ÍjÒGÚ¢OÕ®­Ú¦íÊj‡:´SÚ¥œv«KİÚ#ïä"n¸áFºQî(7Úíq—»›İ-nª»ÕİænwÓÜîNw—›îîv÷¸{İwŸ›éîw¸YîA÷›íæ¸‡İ#îQ¾ñô’{ÙıÄ½êºî·Rt+“Ã'«7¨Qœ­RCğõ)ÃyJƒ«U&h ¸AàZ£T	Fh0¸Jp…ªÀP'pÆ’†Ñ.Ğá ŸFˆ¾Jtˆbaûvè­	 ?Ö¶÷ÁÍšĞğòíİG0@7¾º®© R·‚kt;xXÓÀ@İ.×àFÍ×i6˜¤9à=NÓ\pºêY0NÏƒ^z¥¥ ZuàD­Gh3È¨	Té#P¡-à\}
+nQ;˜ª­àVm·i;¸]Y0M;Àê wj'¸K`ºv»•÷h7¸W]`†ºÁ}ÚfÊƒûœäğ–ˆ®Çc†k,^3B‡á9#u	Ş3Jcğ £Ô/­ñxÒÑúŞtŒÆ£.×•xÕÍŠãY·¨ïšªAxØ­Œ—İ¦!xÚí·MÓ‘xÜ:¯»SÇâywé8û®Øñxàİú"^x¾Œ'Ş«“ğÆ:¼Ogà•3u>y¿.Æ;Ğexè,MÁKÔMxêCš…·ÎÖƒxìÍÆkÖ<—Ú°¯”b_)i_);O~YgáÍ?Q¹}«¬Ö¾Uv½B	¼ûMt+ññKÁ½Àp%ÀpõıU†p 	åx˜j@-pnm}„ùòæŸG‚ÁÔşhÂGƒ£ãß%Œïş¥ÁQú2ˆj,¨ÒI —N1zk"¨Ö$×W _/ÑÙèxè£sA?ju> ½X‹¹Ps±.QJ—‚~º¤t9è§+@JW‚º
+©«A¹®u-¨Ğu`¤µ™jİFënÔ½`ˆf€ÑzÕãúG9=	øÎ¬§ôÏ”î[ Rÿ?¥oëâŸ}Wß§¤? 1k3£ô¢^¡t?Ökè¶@?£‹@?ı¤´XK/eú•V ç B+A­~*´
+ÓoÁ`½úéwà(­ô6ˆiè­ßƒ‘ú/m¢€#TÒú3¡p„>i5‚jıÕ’úucÜv'º±Ç»38åÎ£åüÈıßú±û1í
+Ïãøš{M}İOİOõ÷3·ˆ»?w?'f±[LßÍ£ı¼î–«”¯çıš’Fú”)*õy0y¦Ê¨·yÑÉì„e}»zsìâ<T%ŸÏî±½WÒrH‚Tæ»YëwúMò¾»€˜¶ı‘–×WöÆ‡Œ§BOw·ü¯¿¾;eú‚Ğng8oİ'¯Fû]¤Ki*³®IQŒ˜ƒ×v“q±y½é¾Áwöğ‹rTvôó}®è.ÓÚ‚µ:¢½å'ôùøC.8ÿ«ßMıÿ"´»ÓÙÃs†Å¹­ôoöJ…'½cûÒÛÀGa_Û@Ü_<³Ë×_¢>ç™…,&şÜd%xÙ7ªs¯ÜŞ÷ËY£teåˆ¦œ[‚õkò`¯d•X¯¤yÂoŒïëEŸäÊ¯ß‡w5¼i’2ÍÓÈˆ+ğé/÷r%°HĞ*Ÿ#´&¿>ëxFÃöÛgÛm)ğû¨7}ÁçòGë5ØlúnèÁ®ûıä$>µĞÊ¾ÚiVl¶ğFZ0ïŠ”¾¡NãüM8®óßè±MZú¹ÿØw½UÏıC]r[>¯IğÍ¡şø`ô]ëmhiíØá¹¢©ŸóE~Á¿­ÿÊ·cücÌ E’Å™ægc¸wø§i-¯ø¯"±-h1mÆ¿	k¾ë_¥gÊîó×¿”¬ìĞ;AŠ¤õlÅdc7tpº.Éï³TBq{Ï±IÒPÓ”¬õ)ü}ïÒ>´üŒ•Õ<D2N„BßƒìÑÒğÿ½oAK¾ÚÆøõD°“Ø¦jâr¾ŸŞ‰}y^‚8©$xb¨gÇßb‡6oq™}“ŸSÿğ-ó[Ê¬š`¾Ò`½@D%şOØ¥C¥~—éØoÛ÷›zÒÏÊâaŒg`OÓ7fÖÅu>5¾|àú®±YXw^ßM¶Û3_YíßæÜmW[H5»`vÓØÇİùF‚«~wø™fë]ZÃ³Cû&mO‹ù&ÎkI•¼d‘Óé? Ô¼ı~~Î$´5f6§iµ'í³o¯÷S™­ÃªmıÅ³u—îÖ½š¡Gm&ÿê™½7èC5ªY-úØa~şe7–ùùÉîwª›à&ºÓÜéîfé¯¸ùî5fåÌÈ™/VDÃÔôQôQ?Pˆª?Hh è§jĞÏ4(Ñ] b+¢˜­ˆ¢š"¶"Š›NQ} úª¤lu‘Tèk«‹”ARÍ ¡³ÕEÜV[]Dlu±uE/´~EÎ¾¾íl]ÑÛÖ¥¶®èeëŠŞ¶®(E‹ÿO%` ¢ ÂÊv¹b`¤âàH•‚Œ(-ñIP®HZÉ/±’Ÿ"JN8F[ùÏR9HÀÕŞ¨)1U‚¨ƒ³”}UJÌ^¥¡ıœÃ5Tª¯áà 'ˆÕ3aVÏ„Y=>|Q¬	N°ÕóœX=>ÑğeÃXÃ8àt`÷DÄJš«SÀ¹š j4œ¯ÓÁ±šÆÛªúB[UO´Uõ©bUM˜U5ñçƒ‹t˜ÀÕE«jèR0Q¬ª	³ª&Ìªšğ•àt[UŸa«êIšú‰µ5r¦€2[aŸi+ìót#8_7ÃÌ“NÑc`°­ª·Uõ9¶ª>ÁVÕØªúl±ª&ÌªšøçÀ—lU=ÖVÕ'Ùªú½ zÛÚz¼­­'ÚÚú"-mm}±X[^
+†h8ÍVØ“l…}¦V‚Å
+›ğ*p‘ŞıUØjû½&ÚjûD­§Ûjû$­çÚjû<­½¬Uœb­âJkWY«¸B´
+bhÄĞ*ˆi—h8JÛÁåÀq¶uŒ«uµ:Úv±â¶‹5Ôö¯†ÛşUµí_aûW#lÿªÖVç§ÚîĞ0Ûe-ê2[©_j+õKmhµ¥Ël]~‚­ËO¶uùÅ¶kTe»F}õ¼¢Ò‘Ñ£ğİoHşMû…œ‘Ã¿ç[×s^LØmäÎ9{Š%rŒ‡|'AIßÈ¹Å×ƒVîå µşEæ›Kˆyßw‘;Kˆ'x˜sWr÷;>*'ô=F¾ªÿmÂÏ¾Öûu ‘­ñ çøQ¿ÉæAoøá²P¥öå…±9t¨3MÖX)ø&÷V’ã[ Å‚´g!¤İÌ±-?ÃËB›(UgÑ'1£{¹³-4^´A¹ğ¾>\7ÉæÉ2ÉEŞïÚ@î·‘Í¿eöÏú6hWrwùİÆ?Gš?›Ÿš.2»° %;‰æ” 	ÜÿĞÿÆ·j	½9VÌaíHe1=¿]êw¨lo¿†Jgs§—CöŒ´ù6P2˜Ñ%}M"wº f6ƒ";’İv‚lOOŞ`n™ıBßİ°vPô=ÇÔş?ÉÇ9¿Š„<%Q¼uô¦Üñ½æÙa6ú @>eµVÂ<)a"?ÿê*|G’¶Ù45¿°t…óş˜AP „ÒÌºlN|¨å9û¦‚ØÂõ),·µ°ÏJV²õ-hÅPb3hìb½İnóUã@(©ÒĞE/7Z¸"/m1©‰U<4#ä‡uôhSd½¹SÑbÏâo!ş¾Ÿo¦´Öş÷óé
+ZN®Ç7Ní9Óı‘J*{fËd¯°µmNIëˆ;m–ªP½,=¡&[Ç²ã*¼´jó6zuÀ‹=`E¸ÚDì6Uj£Ù>eû½1HÊPÎµĞO^Î¿Q^'ËİÑƒu{ØËğH€O½ßÇì²»1Æ¥px]~ÉZk:.¾‡ñŸæG2İÿàßfßòWğDŞgû~¿ª³=›÷±Ì2¿ƒ«WÈßl­² "œ­p^G(mw6Ú±Å×¡	!´[6ø÷¬­Em,±qÚxÖIf©¾Õ©–´¯ú•`­º0¼ç7æß²‹öü¶Ägw¸ÕŸ’oS	Úwø÷K•¶!JœĞ®™ØÖüÓáKË5k-±ıÖ?áñ€wB¥@Öc|äÿÈ‘QØ ¢\æ‹…ıK~wxkás¡FØ"\Çx•åïRæ.›MtÚXÜ	²À~g(x§I²~¥ZŒÕ–“v½ùl¯ŸÚ¤¼ŸÈŞè5-JàìÛÇj©Ã[¼¥}‹´«"¿ºˆ>¦ÛêÃîŸè¶×ıBJWĞW¼?Ï£WŞáP¾El(ºãÛ$ë­Í™õ)öféşÖ´',ß4·ySÏÏ*ÒÂ^6y¡Xúnãh³Æ.h§Ù
+ÏËï:²‚,üVY+äë-ÖÃ³¿'ä?‰ıø2RÈFuÚ»É4ÀæÏÆ=jöö¶’÷ÙmŠ%ëâºÍzŠÑ—åÛd)½†ıšçHÁ¬´ÛF(×âÑ¤‡}8ş’È_)ìÓ¾=T'=|#B=èŞßg¢½Ç<Wæe2¯¶‘:RhO›×¡è¦5Å8›t³D—!®·rÕ•7{ùíØ¢ú­ğâŒ‡É.Gd>¸Råö\S5×\/0.UĞ²»¬½5K„êÍ×æç
+Õy˜ã´âÕœS~ék,æ›5TBŒy¤O)Mx(TíßâlP¥ŸGÚzö„¿g`•Ç:³_Jå!/]hOkYY rxÿÄ¯€C£Í
+æøíìŞÏcLj¦¯}ÁÿÔø×¨‹¼Æ8ğëª™hX‚¼e”<ğ	›ïnjİZ‚í|5…kĞîtó?;†ì²§Ç¯–X{æ^¸ß%òº¶¾ò ‹ælv€6š¯g´j·÷Ã~ØU0)	µ«}k_¦1@7®õmaÿßì[êM¡ÙLK¶›v·İcóà‹}[Ì
+_à9É×V…ÇÑüş+)m—İ®-d9Ë¡dáSëÔˆù
+Tæël§x1u¹°ê¦¾Wû Ûd¥@ŞÜÙ‚ıºo”Ø*9ní®Ñ·Ø®8ó*ĞÀld=wæ´˜ˆû«İzµW¨‡İa»0
+f_d³ü2j¦ÁÒëj$³ëÀ™²ú7)ï7VjKİiš„ö¥á·Êüï{PÖÚõwlV’4»,²<–\“†rÂ/+Mæâÿû§üãàAÿ4¡¯S>dZ[mpı2åşÿIŞ.ZÖOà°Áÿ{.Ã6ßğÏù5\¯ğÿï¨JqîÄœî÷ş¤ÂU7¿â,¥gëZ@Tğ.ü]ÁÂVn[7åzÚ{ôÚ™oéå…ë\Ûˆ|Š°Ë
+×ª iAÅv9zZãûV[%§CkS8mq½J±L~¯#\®vï]wş\Ù/æ¡€vÈÉBÙmv%<
+¾é™­º-16“"•]“îm¨Ké|¾f;îô­ ®ƒ†ÖäÛ¹pö—ßcj¥|»·½ø;¿¡^xeñµïÒûî;1şb¨¶ºÄXÚv³K`•v³çâ¿øí¡ùróóLüEgşµ¦ÇùËó¢}}©‰üûµŞí³…Ö¶c7hÃOmÎÑiûT{ıõ—”]ß¨G»ÄB9‘ºW»´…j¦%?KlÍÛe§ÙÅø[+
+Kíø,¯¿|aëÑıİÅÛûßA;Ú Ù^æ®@T°ÖJAË‘*U­]›æ>Ac‚4¬Sƒ»GÚ9cGAåà~’ã‘–½R1ã0Ôo²¸$dÅµ¡Ö×s£/’&é¾4¶—Şè9¿Ï× ©”)òüÓ.U(¡¤ù—3›'‘Ì?gÔ=F#4ĞïAje>×*ÅÈ%%Bí(ääêñ×Ï|ÿ›Ûë>Û§¾»°ÆïiÈ×·…W›áï»üm¥+Ü,\h¹6KŠ´£P>ÓÛÒø·îŠä‰í+ß¡oáÀ5lkë¦Â\6Ó*¨ât0v;ôßÅ	û¿}m·Hî"şbsy›[ì¶±İ<;´ÏĞQ°cvLÁ>K¼À’
+vOÚ¾n[Úñ®-ìû{ÚwÁ®Ã2ŠŒ­&‡o0»lÌïÂØºRÖ÷‰ÒÚ%R¤åö6·,:¶(ØMÿïi7İ…PÌ«Šõ/‡tY¿¸¼`÷?¼¦.ö\Z;ÈjçÛ
+¿à—zkXÎ~¡%[tÓ½·ÖÎèö•·¹EÖ¦[Ì7ÚÕ‹Êß9Å¬@'ÀBv66Íö”WùÖ"b™Aq|ÏR5Yº×íhá¶zìšçÔú#úãÅ÷ïİiäÃ«'oğöÕ°l÷[d¶Ä–{ŸùÅÅûu³Tñöš×ò²áıº¿^³½gi
+~M×`‡"Ù¼a?h²>µ»´ï½‡³˜Jh¤2¡YéUÒ”ÎïzÔôëÉph½²­ÑTn’Ë¡4q=Ù­K2ş…ö¯Gûëm^gOO¨2Ÿ.Ö÷Z¯RIPÜr–Ø.e-Ş³•{De/»·H1®K@¸ßA	ÒÊ*±Ù#ücğd^±şÎÒû¸Y.JÃ1?»3i=<›(›°E³=÷Qç7Ù“–ä/Û¿¯í¡I™IÓ(mvëQĞ¨QQ®úN€üw€È-GB;“uûšM*º×õç¶|xkx¿M¬<…óéÂa¸z–½Ÿß¡ßS°Î÷Å ß`dé
+Ÿh)éq“.Şoäu­Ü÷7Qò¶K…J^ÑÔüE_\Ìì÷Œ/ªó7{Ùİ(¡Yıò¿Š„eb=Øswñ÷s‹×™ßâ´ó³t¨¿^dŒ.±§òşbçıùJ™oÉï0–ê­ó¹‚¯›GäãÂ>_p2.¦[Òìœ
+â,G¿7F
+÷‘èo7B|ÁÀş£L#Ç5Aª(n•íÔD4hiÆºü¨G¸Ì¿«HV.±R¯‚ÚÆãÕPà¹™B»(İCË)¸òÍA®„_/6Jl*ò5¨ˆ
+ûİeìgó»¿}£aá~…[«¬¨]¶2“jFŞN«‰²ĞX¼…ö’v$Sx~Ø.ß÷»ö²ÙÕ*üWì«J±‚P¬Àb½
+r•ì×ª1ÑøÄŠkğ™¦óWX5Ä»T
+µßµ@¡‘r:RÇ#÷K«¾:	ô×É:EiMÊ¿ñ:J×ê:Ò=®g4ZÏé:C/j‰ÎÑ2½©õ[ı^wÚS¤÷ñlè¯õ 2.Òàtˆk$ˆèHPbÏ/÷ÒÑ ¯1zkŒ=Ë~<ˆëK ¡A}$56¯_J'ƒ~:”iè¯¯€j	xdt6(×9` Î:Té|0H€J]ë"±g–«t©.ƒÏå`® 5ºÕUàº3‹®kA­®ÃCoö:=¥ÿ—ğ7õÏ”å[ .D&Ì“È„Ÿ¥ö$r_ı ôÃ?BÿW@¹~h¾^#Ì“Èè°Tëç J<‰Lx8ÌA¦7@­V‚jıÔj¤7AoıDô(×ï@­Cõ6è§5 L¿Ã©¹³4ĞíÎÖ w;Gw®;—ğyÔhÆöÚÓ¾i{Úw\™ó€AêQÌfd¥ ªxD}Àh%Á1êâJ1êşÑZİ}”º?á4ko.ÈŞ˜¡!`˜†‚
+}Tk8^‡ÛAÕßk8yØT{6^æ[SÍ·d¾u‹=/áOÄH'€©æ[2ßºÍ|ëvó­i¡gãï=§ùÙ]:\¯	 &‚{tˆétpªÎ 2_œn¾ø„=-?Çüï~ó¿9æO˜ÿ=eş÷Oö´üæy³u)˜£ËÀló¿9æ³Íÿ4ÿû;ó¿¯i28Ó¼ğ1M“Í¾ˆ^’º\«Á=º	ôÖÍ@ºTj*e–¦ëtø²îÒ]à^M#u7x@÷ é^pŸf Î”Gz œ¬Yà$ZûC’fƒ£4«‡ô8BsÁ(=
+ÔWÑ^z|ÑŞÿ{k9_·–3ÕŞ—µ™›­ÍH´âŸµÖrnµ–3ÍZÎzH/€*{†º=Ã?ÇZÎSÖræXË™-Zá¥ ÜÚÏÃÖ~¾fíçqk?OˆöCxxÊÚÏÕk¬MµV4ÇZÑmÖŠ´Vt§µ¢»D+¢kÁùúWm”ìIşûôxTõà«ú3˜«ğ¨>_U#˜«Í ­&0@~jÿ¨-@jècğ ZÕ&éS0Aí`¢¶‚Ó´œ®íàeÁ$í _Q¸H;ÁÅê—h¸T9p™vƒËÕ®P7¸R{ÀUòàj'ç${›`¼+qÇJöÖÍ½î8÷%Â¼{Cxœ;‰0oàäÎ”l¸ßï."|±»X7¹KÜe’}ãFw…»I²¯d”ØW2ö•Œ2ûJFûJÆ@ûJÆ`ûJFÆ¾’q˜}%£Æ¾’1Ä¾’1Ô¾’ñûJÆáö•Œáö•Œö•Œ#í+ÇÙW2N°¯dœh_Ég_É8Å¾’q–}%ãlûJÆ9ö•Œsí+ç¹¹ndßÇ8ÚŞƒ¸ÀŞƒ˜io¥ìmˆ°÷‹úÚ;ÿ`ïDÜ`ïÍrÜÉŞ8zÈ¾¤q¡½+1ÓŞ;šeï=d=éTëIï¶t¶½7ÑËŞ›}mãKÿ3áC x…–kp”WÆ¿÷İ}³„BB!Ä	B¬¥B¸… RÂµhHBÅBk/”R@­·*V¥´ÔŞ¬Õbë;Ö~ğS?ø¡ıP¿X5ö®õV<³»]743Î3ïï9Ùó?çİ99óüRnÆµ^µ¬=İı½´¸t‰1@DŠ„¥”1‚r*¨d,UTSC-uÔÓ@#S‹ÖHLš†1œ+É(F3†qŒg™Äd®d
+`Ó»»{úy7Çm&ï±o‡e9nïİ»ÇŠwîïŞfU=»wu;/ÇŞ°Ê¦<ìÙoK{÷oïõêûÂ¬myîîİi{}³>lg³İRàw8×?âşçy°ÀzS¶öyä=îëóxıákyW@˜U’®`¥§,ŒF0’rFQÁh*Èx@& RÈX@ªIRÈD@j™H “‰I’ 2®ñ¡èxôBÜ´:îÏÆO¤¦¦ZR]©Ã©3©‹©—Ó™ô¬tgúdúBú/I]òÛ’©%Ï•ô„çÅL’©ÎÌÌ´d:2ç²Æ½ÉÏ{Ñ|Ğ›½ÅóŞÊ€_ğ‹~É»ü²O9Ë‡ü®ÛÜîwºËëÜí§ü´=î±×½îó3î·ß^ïg=èç¼ÁC>ì#>êWüª_óëŞícŞãã>ë)¿çöG>í3şØŸøSïõñ›~ß'½ÏøCü–ßüg½ßsÈJÈdïoYÑéO¤–IÔ1™éÌ¡™E|œ«øW³”kø$ËXN+XÉ*V³†v:XÇz6ĞÉF6±™.¶°íì`'»ØÍzÙË>ú¸‘[8ÍYîçğ çy†ßğ"¿ã÷¼Ä+ü‰?3 N±Ñ:Ã9“r‘+¨£‘Ù´°’.z¸cÜÍ9äi"»=LÚå®ãUoão”Øæzy„¿;ßŸ“¸Âô{;ïØDâJ;9àQşáW¹‘×¼ƒÚLâj7ñºÇø—I\ãfŞğNşí"ÛíâMó“¸ÖkyË¼k‰námOrÉ%DnõB`Ÿ?#"E£©AZƒ†³6¨Œˆ(¥–ãfdFŞ¡˜ˆÚx:RUA="1»ïÖì¦
+'µ=ëÃ¨¤†f0—&ZYF»ó‰©¤Ì¦àc‚/>6xsğqÁ¯
+¾(øøà‹ƒWo	>!ø’à5”!2¼póò‡Â_QtR^åıà5^çŞä-Ş¦PAÃp¹m®p¥«\íÛ]kRAí>ÕV M9õÌ¥•Nb@Z‰£Š¨"8ÄaL³1<@¾¦È¿BLäK”cx D*ˆÑç‘Ê¼C=SÁ€$€dˆ=‹väkÏ#ò”MCÎõ{8¨nÈÙ6Rve9?“´Í9ñòe$Ö˜ÏUÃ)á"²êdxa®²î^†ñğej²r¡÷¾OE·x h…T Í€À•DAA¸Î-8¨²©ÅÂ^2š@$&B—ÛïÛ¿¾xÿÜ·zˆR"¤•ÍPtW×3ÍÃù\‰î­Şæo÷¨wxÌ;=î	O%üÿ2úOyºÆ÷2¸(§ç38¤/£ò}o,ã¨b<ÕL †Båi/}œ.$ç+â”BZ¾5”g{ĞyC·ÉwÇ|<Û-B_Èv)'¤`Èù|nïa/!§³‰ò¸(Uæe=MY6Wê™ê¯ˆYÊ2ŸËú
+IÄR¸ÌçW ²´(Ã[(¥šZêid:3™Í<>F3:mB ÍèBtºmA— ³ˆ‚ÂÛ9AÃ°°sâ	D¦A%%^(îŒDA­Ap–ó8hıuˆ¬ôÙSˆ—½çD*}¶‘}Eïn`¤İq§’‘ÄTùßHÈ¢İÚhpëİ`§İäf»¼Ö-nı¿¿#ú.ÿ%AáÎgozé@f¸   
